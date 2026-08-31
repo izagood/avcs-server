@@ -1,5 +1,7 @@
 # avcs-server
 
+[![CI](https://github.com/izagood/avcs-server/actions/workflows/ci.yml/badge.svg)](https://github.com/izagood/avcs-server/actions/workflows/ci.yml) — the badge *is* the conformance claim: green means the avcs suite passed against a running instance.
+
 A self-hostable, multi-repo server for the **[avcs](https://github.com/izagood/avcs)** protocol.
 
 This is a **clean-room implementation**: it is written from the protocol documents
