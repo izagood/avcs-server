@@ -5,16 +5,15 @@
 // a level is "supported" here exactly when `npm run conformance` in the avcs repo passes it
 // against this server.
 //
-// v0 serves the CORE level: the three endpoints a conforming server cannot be without
-// (docs/26 §0). Everything else is optional by protocol design — the client reads capability
-// flags from GET /version and falls back on its own — so this server is honest about what it
-// does not serve yet: `batch`, `integrate` and `events` advertise false, and the routes
-// answer 404, which the spec defines as "fall back", not "error".
+// Serves every conformance level — core, sync, governance, queue — one plane per section
+// below. The judgement plane (finalize / integrate) is delegated to the library's `Repo`:
+// the queue verdict must be a pure function of objects + Protection (docs/26 §6-2), and a
+// second implementation of that function is exactly how two servers drift apart.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { ObjectStore } from "@izagood/avcs/store";
-import { HUB_PROTOCOL_VERSION } from "@izagood/avcs";
+import { HUB_PROTOCOL_VERSION, Repo } from "@izagood/avcs";
 
 /**
  * One path segment of an org or repo name. The prefix routes straight to a directory under
@@ -28,6 +27,64 @@ const TRAVERSAL_SAFE = (s: string): boolean => SEGMENT.test(s) && s !== "." && s
 const OID = /^[a-z_]+_[0-9a-f]+$/;
 
 const MAX_BODY = 8 * 1024 * 1024;
+const MAX_BATCH_OBJECTS = 4096;
+const MAX_FETCH_OIDS = 4096;
+// The server bounds its OWN /objects/fetch response and says `truncated` — a client cannot
+// make it materialize an unbounded payload by asking for everything at once (docs/26 §4-6).
+const MAX_FETCH_BYTES = 4 * 1024 * 1024;
+
+/** What a parked /events waiter (and every /sync-shaped answer) is answered with. Refs ride
+ *  every response because a finalize can move `head:<view>` without appending an object
+ *  (docs/26 §6-3) — without them a waiter would never see the head advance. */
+interface EventsSnapshot { cursor: number; oids: string[]; refs: Record<string, string> }
+
+async function eventsSnapshot(store: ObjectStore, since: number): Promise<EventsSnapshot> {
+  const all = await store.readObjLog();
+  const oids = since > 0 && since <= all.length ? all.slice(since) : all;
+  return { cursor: all.length, oids, refs: Object.fromEntries(await store.listRefs()) };
+}
+
+/** Parked /events long-polls for ONE repo, answered on the next mutation or their timeout.
+ *  Bounded: past `maxWaiters` a new poll gets 503 immediately — parked sockets are the one
+ *  thing a long-poll endpoint can exhaust. */
+class EventsHub {
+  #waiters = new Set<{ res: ServerResponse; since: number; timer: NodeJS.Timeout }>();
+  readonly #store: ObjectStore;
+  readonly #maxWaiters: number;
+  constructor(store: ObjectStore, maxWaiters = 256) {
+    this.#store = store;
+    this.#maxWaiters = maxWaiters;
+  }
+
+  park(res: ServerResponse, since: number, timeoutMs: number): void {
+    if (this.#waiters.size >= this.#maxWaiters) {
+      sendJson(res, 503, { error: "too many parked /events waiters" });
+      return;
+    }
+    const waiter = { res, since, timer: setTimeout(() => this.#answer(waiter), timeoutMs) };
+    this.#waiters.add(waiter);
+    res.on("close", () => { clearTimeout(waiter.timer); this.#waiters.delete(waiter); });
+  }
+
+  /** Called after every successful mutation (object put, finalize, integrate). Waiters are
+   *  answered with a fresh snapshot even when no oid was appended — a ref-only mutation is
+   *  exactly the case the refs-in-every-response design exists for. */
+  wake(): void {
+    for (const w of [...this.#waiters]) this.#answer(w);
+  }
+
+  #answer(w: { res: ServerResponse; since: number; timer: NodeJS.Timeout }): void {
+    if (!this.#waiters.delete(w)) return;
+    clearTimeout(w.timer);
+    eventsSnapshot(this.#store, w.since)
+      .then((snap) => sendJson(w.res, 200, snap))
+      .catch((e) => sendJson(w.res, 500, { error: String((e as Error).message) }));
+  }
+
+  close(): void {
+    for (const w of [...this.#waiters]) this.#answer(w);
+  }
+}
 
 export interface AvcsServerOpts {
   /** Directory holding one object store per `<org>/<repo>`. Created on demand. */
@@ -44,21 +101,25 @@ export interface AvcsServerHandle {
 export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerHandle> {
   await mkdir(opts.dataDir, { recursive: true });
 
-  // One store handle per repo, created lazily. The store itself is the library's — content
+  // One context per repo, created lazily. The store itself is the library's — content
   // addressing, the interop-safe gate and group-committed durability all ride along, which
   // is the point of building on the published package instead of re-deriving any of it.
-  const stores = new Map<string, ObjectStore>();
-  const storeFor = async (org: string, repo: string): Promise<ObjectStore> => {
+  // The judgement plane opens the same directory as a `Repo` per request, exactly like the
+  // reference — the cross-process finalize lock, not a long-lived handle, is the serializer.
+  interface RepoCtx { dir: string; store: ObjectStore; events: EventsHub }
+  const repos = new Map<string, RepoCtx>();
+  const ctxFor = async (org: string, repo: string): Promise<RepoCtx> => {
     const key = `${org}/${repo}`;
-    let s = stores.get(key);
-    if (!s) {
+    let c = repos.get(key);
+    if (!c) {
       const dir = join(opts.dataDir, org, repo);
       await mkdir(dir, { recursive: true });
-      s = new ObjectStore(dir);
-      await s.init();
-      stores.set(key, s);
+      const store = new ObjectStore(dir);
+      await store.init();
+      c = { dir, store, events: new EventsHub(store) };
+      repos.set(key, c);
     }
-    return s;
+    return c;
   };
 
   const server: Server = createServer((req, res) => {
@@ -91,7 +152,8 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
       return;
     }
     const path = "/" + rest.join("/");
-    const store = await storeFor(org, repo);
+    const ctx = await ctxFor(org, repo);
+    const store = ctx.store;
 
     // ── capability advertisement (docs/26 §3) ─────────────────────────────────────────
     // Advertise exactly what is served. A flag for a route this server does not have would
@@ -102,9 +164,10 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
         protocol: HUB_PROTOCOL_VERSION,
         gated: false,
         auth: "none",
-        integrate: false,
-        events: false,
-        batch: false,
+        integrate: true,
+        events: true,
+        batch: true,
+        batchMaxBytes: MAX_BODY,
       });
       return;
     }
@@ -167,7 +230,181 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
         sendJson(res, 400, { error: String((e as Error).message) });
         return;
       }
+      ctx.events.wake(); // a new object (or an idempotent re-put) is what waiters wait for
       sendJson(res, 200, { oid });
+      return;
+    }
+
+    // ── sync plane (docs/26 §4-2, §4-5, §4-6) ─────────────────────────────────────────
+    if (req.method === "GET" && path === "/sync") {
+      const sinceRaw = Number(url.searchParams.get("since") ?? "0");
+      const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? Math.floor(sinceRaw) : 0;
+      // The cursor is the objlog index. Correctness never depends on it: 0 or out-of-range
+      // degrades to the full set — a wrong cursor costs transfer, never convergence.
+      const snap = await eventsSnapshot(store, since);
+      sendJson(res, 200, { oids: snap.oids, cursor: snap.cursor });
+      return;
+    }
+
+    if (req.method === "POST" && path === "/objects/fetch") {
+      let body: unknown;
+      try { body = JSON.parse(await readBody(req)); }
+      catch (e) { sendJson(res, e instanceof SyntaxError ? 400 : 413, { error: String((e as Error).message) }); return; }
+      const asked = (body as { oids?: unknown } | null)?.oids;
+      if (!Array.isArray(asked)) { sendJson(res, 400, { error: "fetch requires { oids: [...] }" }); return; }
+      if (asked.length > MAX_FETCH_OIDS) { sendJson(res, 413, { error: `fetch exceeds ${MAX_FETCH_OIDS} oids` }); return; }
+      const objects: unknown[] = [];
+      let bytes = 0;
+      let truncated = false;
+      for (const oid of asked) {
+        if (typeof oid !== "string" || !OID.test(oid)) continue; // an unshaped oid can never exist
+        if (!(await store.has(oid))) continue;                   // absence is a raced eviction, not an error
+        const obj = await store.get(oid);
+        bytes += JSON.stringify(obj).length;
+        // Always take at least one past the limit rather than stopping before it — a response
+        // that carries nothing reads as "no progress" and makes the client give up (§4-6).
+        objects.push(obj);
+        if (bytes >= MAX_FETCH_BYTES) { truncated = true; break; }
+      }
+      sendJson(res, 200, { objects, truncated });
+      return;
+    }
+
+    if (req.method === "POST" && path === "/objects/batch") {
+      let body: unknown;
+      try { body = JSON.parse(await readBody(req)); }
+      catch (e) { sendJson(res, e instanceof SyntaxError ? 400 : 413, { error: String((e as Error).message) }); return; }
+      const objects = (body as { objects?: unknown } | null)?.objects;
+      if (!Array.isArray(objects)) { sendJson(res, 400, { error: "batch requires { objects: [...] }" }); return; }
+      if (objects.length > MAX_BATCH_OBJECTS) { sendJson(res, 413, { error: `batch exceeds ${MAX_BATCH_OBJECTS} objects` }); return; }
+      // Per-object verdicts are the load-bearing part (§4-5): one refusal never fails the
+      // request, because the client's push ledger is built from exactly what was accepted.
+      // Validation stays per object and IN ORDER; storage is group-committed via putMany,
+      // falling back to one-by-one when a chunk is refused (the interop gate) so the rest
+      // of the batch still lands.
+      const results: ({ oid: string | null; status: "stored" } | { oid: string | null; status: "rejected"; reason: string })[] = new Array(objects.length);
+      const accepted: { at: number; obj: object }[] = [];
+      for (let i = 0; i < objects.length; i++) {
+        const o = objects[i];
+        if (typeof o !== "object" || o === null || typeof (o as { type?: unknown }).type !== "string") {
+          results[i] = { oid: null, status: "rejected", reason: "object must have a string `type`" };
+          continue;
+        }
+        if ((o as { type: string }).type === "integration") {
+          results[i] = { oid: null, status: "rejected", reason: "integration objects are authored by the integration queue; they cannot be pushed" };
+          continue;
+        }
+        accepted.push({ at: i, obj: o });
+      }
+      if (accepted.length > 0) {
+        let put: { oid: string }[];
+        try {
+          put = await store.putMany(accepted.map((a) => a.obj) as never);
+        } catch {
+          put = [];
+          for (const a of accepted) {
+            try { put.push({ oid: await store.put(a.obj as never) }); }
+            catch (inner) {
+              results[a.at] = { oid: null, status: "rejected", reason: String((inner as Error).message) };
+              put.push({ oid: "" });
+            }
+          }
+        }
+        for (let j = 0; j < accepted.length; j++) {
+          const oid = put[j]?.oid;
+          if (oid) results[accepted[j]!.at] = { oid, status: "stored" };
+        }
+        ctx.events.wake(); // once per batch — waiters re-snapshot regardless of count
+      }
+      sendJson(res, 200, { results });
+      return;
+    }
+
+    // ── governance plane (docs/26 §5, §6-1) ───────────────────────────────────────────
+    if (req.method === "GET" && path === "/refs") {
+      sendJson(res, 200, { refs: Object.fromEntries(await store.listRefs()) });
+      return;
+    }
+
+    if (req.method === "POST" && path === "/finalize") {
+      let body: { view?: unknown; newCheckpoint?: unknown; parentHead?: unknown; by?: unknown };
+      try { body = JSON.parse(await readBody(req)) as typeof body; }
+      catch (e) { sendJson(res, e instanceof SyntaxError ? 400 : 413, { error: String((e as Error).message) }); return; }
+      const { view, newCheckpoint, by } = body;
+      if (typeof view !== "string" || typeof newCheckpoint !== "string" || typeof by !== "string") {
+        sendJson(res, 400, { error: "finalize requires string { view, newCheckpoint, by }" });
+        return;
+      }
+      const parentHead = typeof body.parentHead === "string" ? body.parentHead : null;
+      const repoApi = await Repo.open(ctx.dir);
+      const result = await repoApi.finalize({ view, newCheckpoint, parentHead, by });
+      if (result.finalized) {
+        ctx.events.wake(); // head moved WITHOUT appending an object — the ref-only mutation
+        sendJson(res, 200, result);
+        return;
+      }
+      // A lost CAS race is a 409 conflict; everything else (role, checks, approvals,
+      // incomplete history) is a 422 — the submission itself is unprocessable.
+      sendJson(res, /head moved/.test(result.reason) ? 409 : 422, result);
+      return;
+    }
+
+    // ── judgement plane (docs/26 §6-2, §6-3) ──────────────────────────────────────────
+    if (req.method === "POST" && path === "/integrate") {
+      let body: { view?: unknown; checkpoint?: unknown; by?: unknown; ticketId?: unknown };
+      try { body = JSON.parse(await readBody(req)) as typeof body; }
+      catch (e) { sendJson(res, e instanceof SyntaxError ? 400 : 413, { error: String((e as Error).message) }); return; }
+      const { view, checkpoint, by } = body;
+      if (typeof view !== "string" || typeof checkpoint !== "string" || typeof by !== "string") {
+        sendJson(res, 400, { error: "integrate requires string { view, checkpoint, by }" });
+        return;
+      }
+      if (!(await store.has(checkpoint))) {
+        sendJson(res, 422, { verdict: "rejected", reason: `checkpoint ${checkpoint} not on the server — push it first` });
+        return;
+      }
+      const ticketId = typeof body.ticketId === "string" ? body.ticketId : undefined;
+      // The verdict is the library's, not this server's: docs/26 §6-2 requires every queue
+      // decision to be a pure function of objects + Protection, and `Repo.submitIntegration`
+      // is that function. This server only maps verdicts to status codes.
+      const repoApi = await Repo.open(ctx.dir);
+      const result = await repoApi.submitIntegration({ view, checkpoint, by, ticketId });
+      const status = result.verdict === "advanced" ? 200
+        : result.verdict === "queued" ? 202
+        : result.verdict === "conflict" ? 409
+        : result.verdict === "needs_evidence" ? 428
+        : 422;
+      ctx.events.wake(); // every judged verdict appends an Integration object; advanced also moves the head
+      sendJson(res, status, result);
+      return;
+    }
+
+    if (req.method === "GET" && rest[0] === "integrations" && rest.length === 2) {
+      // Idempotent verdict lookup: the ticket ref points at the recorded Integration object.
+      const ticketId = decodeURIComponent(rest[1]!);
+      const view = url.searchParams.get("view") ?? "main";
+      const ref = await store.getRef(`integration:${view}:${ticketId}`);
+      if (!ref || !(await store.has(ref))) {
+        sendJson(res, 404, { error: "no such integration ticket", view, ticketId });
+        return;
+      }
+      sendJson(res, 200, await store.get(ref));
+      return;
+    }
+
+    if (req.method === "GET" && path === "/events") {
+      const sinceRaw = Number(url.searchParams.get("since") ?? "0");
+      const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? Math.floor(sinceRaw) : 0;
+      const toRaw = Number(url.searchParams.get("timeoutMs") ?? "30000");
+      const timeoutMs = Math.min(Math.max(Number.isFinite(toRaw) ? Math.floor(toRaw) : 30_000, 10), 120_000);
+      // `since` is the SAME cursor /sync uses — one cursor meaning (§6-3). Behind ⇒ answer
+      // now; caught up ⇒ park until a mutation wakes us or the timeout heartbeats.
+      const snap = await eventsSnapshot(store, since);
+      if (snap.oids.length > 0) {
+        sendJson(res, 200, snap);
+        return;
+      }
+      ctx.events.park(res, since, timeoutMs);
       return;
     }
 
@@ -181,7 +418,10 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
   const port = addr && typeof addr === "object" ? addr.port : 0;
   return {
     url: `http://${opts.host ?? "127.0.0.1"}:${port}`,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    close: () => {
+      for (const c of repos.values()) c.events.close(); // answer parked waiters, then stop
+      return new Promise<void>((resolve) => server.close(() => resolve()));
+    },
   };
 }
 

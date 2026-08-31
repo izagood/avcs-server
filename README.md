@@ -20,13 +20,16 @@ AVCS_CONFORMANCE_URL=http://localhost:8420/acme/web npm run conformance   # in t
 | Level | Serves | Status |
 |---|---|---|
 | `core` | `GET /have` · `GET /objects/:oid` · `POST /objects` — enough to clone and push | ✅ conformance-verified |
-| `sync` | incremental cursor, batched transfer | planned |
-| `governance` | ref distribution, gated push | planned |
-| `queue` | integration queue, live events | planned |
+| `sync` | `GET /sync` incremental cursor · `POST /objects/batch` · `POST /objects/fetch` | ✅ conformance-verified |
+| `governance` | `GET /refs` distribution · `POST /finalize` head CAS | ✅ conformance-verified |
+| `queue` | `POST /integrate` verdicts · `GET /integrations/:ticketId` · `GET /events` long-poll | ✅ conformance-verified |
 
-That partial table is not an apology — the protocol is designed so a partial server is a
-first-class one. The client reads capability flags from `GET /version` and falls back on its
-own; this server advertises exactly what it serves.
+All four levels, verified against the avcs conformance suite on every commit. The judgement
+plane (finalize / integrate) is delegated to the library's `Repo` — a queue verdict must be a
+pure function of objects + Protection, and a second implementation of that function is exactly
+how two servers drift apart. Transport auth (`AVCS-Sig`) and gated push are the remaining
+roadmap: this server currently runs open (`gated: false`, `auth: "none"`), which fits a
+trusted-network deployment; don't put it on the open internet yet.
 
 ## Run
 
