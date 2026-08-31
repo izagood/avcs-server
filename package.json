@@ -1,7 +1,7 @@
 {
   "name": "@izagood/avcs-server",
   "version": "0.3.0",
-  "description": "Self-hostable multi-repo server for the avcs protocol \u2014 a transport-agnostic protocol engine with SPI seams, plus a stdlib http binding.",
+  "description": "Self-hostable multi-repo server for the avcs protocol — a transport-agnostic protocol engine with SPI seams, plus a stdlib http binding.",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
