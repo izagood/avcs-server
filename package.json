@@ -1,0 +1,21 @@
+{
+  "name": "avcs-server",
+  "version": "0.1.0",
+  "description": "Self-hostable multi-repo server for the avcs protocol",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": { "avcs-server": "./src/main.ts" },
+  "scripts": {
+    "start": "node --experimental-strip-types src/main.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@izagood/avcs": "^0.43.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.0.0"
+  },
+  "engines": { "node": ">=22.6" }
+}

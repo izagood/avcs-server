@@ -1,0 +1,49 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  test:
+    name: typecheck + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.x', cache: npm }
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  conformance:
+    # 이 레포의 진짜 게이트 — avcs 의 적합성 스위트를 실행 중인 이 서버에 대고 돌린다.
+    # 스위트가 곧 프로토콜 계약이므로, 여기가 초록이면 "avcs 호환" 주장이 검증된 것이다.
+    name: avcs conformance (core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: server }
+      - uses: actions/checkout@v4
+        with: { repository: izagood/avcs, path: avcs }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.x' }
+      - name: Install
+        run: |
+          cd server && npm ci
+          cd ../avcs && npm ci
+      - name: Start server + seed one repo
+        run: |
+          cd server
+          AVCS_SERVER_DATA=/tmp/data PORT=8419 npm start &
+          sleep 2
+          cd ../avcs
+          # 클론 검사는 내용을 요구한다 — 실사용 그대로 core 3개 엔드포인트로 시드한다.
+          mkdir /tmp/seed && cd /tmp/seed
+          node --experimental-strip-types $GITHUB_WORKSPACE/avcs/src/cli.ts init .
+          echo seed > a.txt
+          node --experimental-strip-types $GITHUB_WORKSPACE/avcs/src/cli.ts commit -m seed
+          node --experimental-strip-types $GITHUB_WORKSPACE/avcs/src/cli.ts push http://127.0.0.1:8419/acme/web
+      - name: Conformance
+        run: |
+          cd avcs
+          AVCS_CONFORMANCE_URL=http://127.0.0.1:8419/acme/web npm run conformance
