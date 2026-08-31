@@ -17,8 +17,9 @@ jobs:
 
   conformance:
     # 이 레포의 진짜 게이트 — avcs 의 적합성 스위트를 실행 중인 이 서버에 대고 돌린다.
+    # 전 레벨(core→sync→governance→queue)이 적용된다 — skip 0 이 초록의 조건이다.
     # 스위트가 곧 프로토콜 계약이므로, 여기가 초록이면 "avcs 호환" 주장이 검증된 것이다.
-    name: avcs conformance (core)
+    name: avcs conformance (all levels)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
