@@ -206,3 +206,31 @@ test("redaction push 는 403 — 적용 없이 저장하면 클라이언트가 �
     assert.equal(res.status, 403);
   } finally { await s.cleanup(); }
 });
+
+// ── 요청 컨텍스트 패스스루 (임베더의 인증이 엔진 밖에 있을 때) ───────────────
+
+test("hooks: 바인딩이 준 per-request context 가 이벤트로 흐른다", async () => {
+  const { mkdtemp: mk } = await import("node:fs/promises");
+  const { ObjectStore } = await import("@izagood/avcs/store");
+  const { RepoEngine } = await import("../src/engine.ts");
+  const dir = await mk(join(tmpdir(), "avcs-server-ctx-"));
+  const store = new ObjectStore(dir);
+  await store.init();
+  const seen: unknown[] = [];
+  const engine = new RepoEngine({
+    repo: { org: "acme", repo: "web" },
+    store,
+    hooks: {
+      beforeWrite: (ev) => { seen.push(ev.context); return { ok: true as const }; },
+      afterWrite: (ev) => { seen.push(ev.context); },
+    },
+  });
+  const res = await engine.putObject(OBJ, undefined, { actorId: "human:ctx" });
+  assert.equal(res.status, 200);
+  assert.deepEqual(seen, [{ actorId: "human:ctx" }, { actorId: "human:ctx" }], "before·after 모두에서 같은 컨텍스트");
+  const bare = await engine.putObject(OBJ, undefined);
+  assert.equal(bare.status, 200);
+  assert.equal(seen[2], undefined, "안 주면 없다 — 엔진이 지어내지 않는다");
+  engine.close();
+  await rm(dir, { recursive: true, force: true });
+});

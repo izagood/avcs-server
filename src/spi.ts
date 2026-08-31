@@ -82,6 +82,13 @@ export interface WriteEvent {
   count: number;
   /** JSON bytes of the incoming object(s) — what a plan/quota check projects forward. */
   bytes: number;
+  /**
+   * Opaque per-request context the BINDING passed in (e.g. the embedder's own auth result,
+   * resolved by its framework middleware before the engine ran). The engine never reads it —
+   * it exists so hooks written by the same embedder can see their own request identity when
+   * the engine itself is not the authenticator (gated: false behind a product's auth layer).
+   */
+  context?: unknown;
 }
 
 /** A pre-hook refusal. The status is the hook's choice: 429 throttles (with retry-after),

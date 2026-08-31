@@ -199,7 +199,7 @@ export class RepoEngine {
     return { status: 200, body: await this.#store.get(oid) };
   }
 
-  async putObject(raw: string, authHeader: string | undefined): Promise<Answer> {
+  async putObject(raw: string, authHeader: string | undefined, context?: unknown): Promise<Answer> {
     const auth = await this.#verifyWrite("POST", "/objects", raw, authHeader);
     if (!("ok" in auth)) return auth;
     let obj: unknown;
@@ -211,7 +211,7 @@ export class RepoEngine {
     const shape = refuseShape(obj);
     if (shape) return { status: shape.status, body: { error: shape.error } };
     const bytes = Buffer.byteLength(raw);
-    const ev: WriteEvent = { repo: this.#repo, kind: "objects", count: 1, bytes, ...(auth.keyId ? { actor: auth.keyId } : {}) };
+    const ev: WriteEvent = { repo: this.#repo, kind: "objects", count: 1, bytes, ...(auth.keyId ? { actor: auth.keyId } : {}), ...(context !== undefined ? { context } : {}) };
     const veto = await this.#vetoed(ev);
     if (veto) return veto;
     let oid: string;
@@ -228,7 +228,7 @@ export class RepoEngine {
     return { status: 200, body: { oid } };
   }
 
-  async batch(raw: string, authHeader: string | undefined): Promise<Answer> {
+  async batch(raw: string, authHeader: string | undefined, context?: unknown): Promise<Answer> {
     const auth = await this.#verifyWrite("POST", "/objects/batch", raw, authHeader);
     if (!("ok" in auth)) return auth;
     let body: unknown;
@@ -245,6 +245,7 @@ export class RepoEngine {
       repo: this.#repo, kind: "objects/batch", count: objects.length,
       bytes: sizes.reduce((a, b) => a + b, 0),
       ...(auth.keyId ? { actor: auth.keyId } : {}),
+      ...(context !== undefined ? { context } : {}),
     };
     const veto = await this.#vetoed(ev);
     if (veto) return veto;
@@ -329,7 +330,7 @@ export class RepoEngine {
     return { status: 200, body: { refs: Object.fromEntries(await this.#store.listRefs()) } };
   }
 
-  async finalize(raw: string, authHeader: string | undefined): Promise<Answer> {
+  async finalize(raw: string, authHeader: string | undefined, context?: unknown): Promise<Answer> {
     if (!this.#judge) return { status: 404, body: { error: "not found" } };
     const auth = await this.#verifyWrite("POST", "/finalize", raw, authHeader);
     if (!("ok" in auth)) return auth;
@@ -343,7 +344,7 @@ export class RepoEngine {
     if (typeof view !== "string" || typeof newCheckpoint !== "string" || typeof by !== "string") {
       return { status: 400, body: { error: "finalize requires string { view, newCheckpoint, by }" } };
     }
-    const ev: WriteEvent = { repo: this.#repo, kind: "finalize", count: 1, bytes: Buffer.byteLength(raw), ...(auth.keyId ? { actor: auth.keyId } : {}) };
+    const ev: WriteEvent = { repo: this.#repo, kind: "finalize", count: 1, bytes: Buffer.byteLength(raw), ...(auth.keyId ? { actor: auth.keyId } : {}), ...(context !== undefined ? { context } : {}) };
     const veto = await this.#vetoed(ev);
     if (veto) return veto;
     const parentHead = typeof body.parentHead === "string" ? body.parentHead : null;
@@ -360,7 +361,7 @@ export class RepoEngine {
   }
 
   // ── judgement plane (docs/26 §6-2, §6-3) ────────────────────────────────────────────
-  async integrate(raw: string, authHeader: string | undefined): Promise<Answer> {
+  async integrate(raw: string, authHeader: string | undefined, context?: unknown): Promise<Answer> {
     if (!this.#judge) return { status: 404, body: { error: "not found" } };
     const auth = await this.#verifyWrite("POST", "/integrate", raw, authHeader);
     if (!("ok" in auth)) return auth;
@@ -377,7 +378,7 @@ export class RepoEngine {
     if (!(await this.#store.has(checkpoint))) {
       return { status: 422, body: { verdict: "rejected", reason: `checkpoint ${checkpoint} not on the server — push it first` } };
     }
-    const ev: WriteEvent = { repo: this.#repo, kind: "integrate", count: 1, bytes: Buffer.byteLength(raw), ...(auth.keyId ? { actor: auth.keyId } : {}) };
+    const ev: WriteEvent = { repo: this.#repo, kind: "integrate", count: 1, bytes: Buffer.byteLength(raw), ...(auth.keyId ? { actor: auth.keyId } : {}), ...(context !== undefined ? { context } : {}) };
     const veto = await this.#vetoed(ev);
     if (veto) return veto;
     const ticketId = typeof body.ticketId === "string" ? body.ticketId : undefined;
