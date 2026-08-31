@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAuthHeader, generateKeypair } from "@izagood/avcs";
 import { ObjectStore } from "@izagood/avcs/store";
-import { startAvcsServer, type AvcsServerOpts, type WriteEvent } from "../src/server.ts";
+import { startAvcsServer, type AvcsServerOpts, type StoredObject, type WriteEvent } from "../src/server.ts";
 
 async function server(opts: Partial<AvcsServerOpts>) {
   const dataDir = await mkdtemp(join(tmpdir(), "avcs-server-spi-"));
@@ -134,7 +134,7 @@ test("readAccess=token: 맨몸 읽기는 401, 유효한 Bearer 는 200, /version
 // ── 훅 (제품 수명주기) ───────────────────────────────────────────────────────
 
 test("hooks: beforeWrite 거부는 요청을 막고 retry-after 를 나르고, 허용 요청은 afterWrite 에 저장된 oid 로 보인다", async () => {
-  const seen: (WriteEvent & { oids: string[] })[] = [];
+  const seen: (WriteEvent & { stored: StoredObject[] })[] = [];
   let veto = true;
   const s = await server({
     hooks: {
@@ -160,7 +160,10 @@ test("hooks: beforeWrite 거부는 요청을 막고 retry-after 를 나르고, �
     assert.equal(ok.status, 200);
     const { oid } = await ok.json() as { oid: string };
     assert.equal(seen.length, 1, "성공한 쓰기는 afterWrite 로 관측된다");
-    assert.deepEqual(seen[0]!.oids, [oid], "관측된 oid 는 저장된 그 oid 다");
+    assert.deepEqual(seen[0]!.stored.map((s) => s.oid), [oid], "관측된 oid 는 저장된 그 oid 다");
+    assert.equal(seen[0]!.stored[0]!.type, "intent", "라우팅용 type 이 실린다");
+    assert.ok(seen[0]!.stored[0]!.bytes > 0, "계량용 bytes 가 실린다");
+    assert.ok(seen[0]!.bytes > 0, "beforeWrite 가 보는 요청 bytes 도 이벤트에 있다");
   } finally { await s.cleanup(); }
 });
 

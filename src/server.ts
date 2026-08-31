@@ -11,7 +11,7 @@ import { Repo } from "@izagood/avcs";
 import { RepoEngine, MAX_BODY } from "./engine.ts";
 import type { Answer, Hooks, IdentityProvider, JudgementBackend, RepoRef, StorageBackend } from "./spi.ts";
 
-export type { Answer, Hooks, IdentityProvider, JudgementBackend, RepoRef, StorageBackend, WriteEvent, WriteVeto } from "./spi.ts";
+export type { Answer, Hooks, IdentityProvider, JudgementBackend, RepoRef, StorageBackend, StoredObject, WriteEvent, WriteVeto } from "./spi.ts";
 export { RepoEngine, coreNativeIdentity } from "./engine.ts";
 
 /**

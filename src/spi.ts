@@ -80,15 +80,28 @@ export interface WriteEvent {
   actor?: string;
   /** Objects in the request (1 except for a batch). */
   count: number;
+  /** JSON bytes of the incoming object(s) — what a plan/quota check projects forward. */
+  bytes: number;
 }
 
 /** A pre-hook refusal. The status is the hook's choice: 429 throttles (with retry-after),
- *  403 refuses outright — both are protocol answers (docs/26 §4-4). */
+ *  403 refuses outright, 402 is a product's plan/quota refusal — all end up as plain
+ *  `{ error }` answers, which is all the protocol requires of an error (docs/26 §4-4). */
 export interface WriteVeto {
   ok: false;
-  status: 403 | 429;
+  status: 402 | 403 | 429;
   error: string;
   retryAfterSeconds?: number;
+  /** Extra fields to carry in the error body (e.g. a quota's violations list). */
+  details?: Record<string, unknown>;
+}
+
+/** Per-object summary an afterWrite hook receives — enough for metering (bytes), routing
+ *  (type) and audit (oid) without re-reading the store. */
+export interface StoredObject {
+  oid: string;
+  type: string;
+  bytes: number;
 }
 
 /**
@@ -99,7 +112,7 @@ export interface WriteVeto {
  */
 export interface Hooks {
   beforeWrite?(ev: WriteEvent): Promise<{ ok: true } | WriteVeto> | { ok: true } | WriteVeto;
-  afterWrite?(ev: WriteEvent & { oids: string[]; verdict?: string }): void | Promise<void>;
+  afterWrite?(ev: WriteEvent & { stored: StoredObject[]; verdict?: string }): void | Promise<void>;
 }
 
 /** One protocol answer, transport-agnostic. A binding maps it onto its framework. */

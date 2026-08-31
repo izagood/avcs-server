@@ -14,6 +14,7 @@ import type {
   JudgementBackend,
   RepoRef,
   StorageBackend,
+  StoredObject,
   WriteEvent,
 } from "./spi.ts";
 
@@ -167,12 +168,12 @@ export class RepoEngine {
     if (v.ok) return null;
     return {
       status: v.status,
-      body: { error: v.error },
+      body: { error: v.error, ...(v.details ?? {}) },
       ...(v.retryAfterSeconds !== undefined ? { retryAfterSeconds: v.retryAfterSeconds } : {}),
     };
   }
 
-  #observed(ev: WriteEvent & { oids: string[]; verdict?: string }): void {
+  #observed(ev: WriteEvent & { stored: StoredObject[]; verdict?: string }): void {
     // Best-effort by contract: the mutation is already durable; a product hook failure is
     // the product's problem, never the protocol answer's.
     try {
@@ -209,7 +210,8 @@ export class RepoEngine {
     }
     const shape = refuseShape(obj);
     if (shape) return { status: shape.status, body: { error: shape.error } };
-    const ev: WriteEvent = { repo: this.#repo, kind: "objects", count: 1, ...(auth.keyId ? { actor: auth.keyId } : {}) };
+    const bytes = Buffer.byteLength(raw);
+    const ev: WriteEvent = { repo: this.#repo, kind: "objects", count: 1, bytes, ...(auth.keyId ? { actor: auth.keyId } : {}) };
     const veto = await this.#vetoed(ev);
     if (veto) return veto;
     let oid: string;
@@ -222,7 +224,7 @@ export class RepoEngine {
       return { status: 400, body: { error: String((e as Error).message) } };
     }
     this.wake(); // a new object (or an idempotent re-put) is what waiters wait for
-    this.#observed({ ...ev, oids: [oid] });
+    this.#observed({ ...ev, stored: [{ oid, type: (obj as { type: string }).type, bytes }] });
     return { status: 200, body: { oid } };
   }
 
@@ -238,7 +240,12 @@ export class RepoEngine {
     const objects = (body as { objects?: unknown } | null)?.objects;
     if (!Array.isArray(objects)) return { status: 400, body: { error: "batch requires { objects: [...] }" } };
     if (objects.length > MAX_BATCH_OBJECTS) return { status: 413, body: { error: `batch exceeds ${MAX_BATCH_OBJECTS} objects` } };
-    const ev: WriteEvent = { repo: this.#repo, kind: "objects/batch", count: objects.length, ...(auth.keyId ? { actor: auth.keyId } : {}) };
+    const sizes = objects.map((o) => Buffer.byteLength(JSON.stringify(o) ?? ""));
+    const ev: WriteEvent = {
+      repo: this.#repo, kind: "objects/batch", count: objects.length,
+      bytes: sizes.reduce((a, b) => a + b, 0),
+      ...(auth.keyId ? { actor: auth.keyId } : {}),
+    };
     const veto = await this.#vetoed(ev);
     if (veto) return veto;
     // Per-object verdicts are the load-bearing part (§4-5): one refusal never fails the
@@ -258,7 +265,7 @@ export class RepoEngine {
       }
       accepted.push({ at: i, obj: o as object });
     }
-    const stored: string[] = [];
+    const stored: StoredObject[] = [];
     if (accepted.length > 0) {
       let put: { oid: string }[];
       try {
@@ -277,13 +284,14 @@ export class RepoEngine {
       for (let j = 0; j < accepted.length; j++) {
         const oid = put[j]?.oid;
         if (oid) {
-          results[accepted[j]!.at] = { oid, status: "stored" };
-          stored.push(oid);
+          const at = accepted[j]!.at;
+          results[at] = { oid, status: "stored" };
+          stored.push({ oid, type: (accepted[j]!.obj as { type: string }).type, bytes: sizes[at] ?? 0 });
         }
       }
       this.wake(); // once per batch — waiters re-snapshot regardless of count
     }
-    this.#observed({ ...ev, oids: stored });
+    this.#observed({ ...ev, stored });
     return { status: 200, body: { results } };
   }
 
@@ -335,19 +343,19 @@ export class RepoEngine {
     if (typeof view !== "string" || typeof newCheckpoint !== "string" || typeof by !== "string") {
       return { status: 400, body: { error: "finalize requires string { view, newCheckpoint, by }" } };
     }
-    const ev: WriteEvent = { repo: this.#repo, kind: "finalize", count: 1, ...(auth.keyId ? { actor: auth.keyId } : {}) };
+    const ev: WriteEvent = { repo: this.#repo, kind: "finalize", count: 1, bytes: Buffer.byteLength(raw), ...(auth.keyId ? { actor: auth.keyId } : {}) };
     const veto = await this.#vetoed(ev);
     if (veto) return veto;
     const parentHead = typeof body.parentHead === "string" ? body.parentHead : null;
     const result = await this.#judge.finalize({ view, newCheckpoint, parentHead, by });
     if (result.finalized) {
       this.wake(); // head moved WITHOUT appending an object — the ref-only mutation
-      this.#observed({ ...ev, oids: [], verdict: "finalized" });
+      this.#observed({ ...ev, stored: [], verdict: "finalized" });
       return { status: 200, body: result };
     }
     // A lost CAS race is a 409 conflict; everything else (role, checks, approvals,
     // incomplete history) is a 422 — the submission itself is unprocessable.
-    this.#observed({ ...ev, oids: [], verdict: "refused" });
+    this.#observed({ ...ev, stored: [], verdict: "refused" });
     return { status: /head moved/.test(result.reason) ? 409 : 422, body: result };
   }
 
@@ -369,7 +377,7 @@ export class RepoEngine {
     if (!(await this.#store.has(checkpoint))) {
       return { status: 422, body: { verdict: "rejected", reason: `checkpoint ${checkpoint} not on the server — push it first` } };
     }
-    const ev: WriteEvent = { repo: this.#repo, kind: "integrate", count: 1, ...(auth.keyId ? { actor: auth.keyId } : {}) };
+    const ev: WriteEvent = { repo: this.#repo, kind: "integrate", count: 1, bytes: Buffer.byteLength(raw), ...(auth.keyId ? { actor: auth.keyId } : {}) };
     const veto = await this.#vetoed(ev);
     if (veto) return veto;
     const ticketId = typeof body.ticketId === "string" ? body.ticketId : undefined;
@@ -385,7 +393,7 @@ export class RepoEngine {
       : result.verdict === "needs_evidence" ? 428
       : 422;
     this.wake(); // every judged verdict appends an Integration object; advanced also moves the head
-    this.#observed({ ...ev, oids: [], verdict: String(result.verdict) });
+    this.#observed({ ...ev, stored: [], verdict: String(result.verdict) });
     return { status, body: result };
   }
 
