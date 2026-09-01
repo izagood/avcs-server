@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "avcs-server": "./src/main.ts"
+    "avcs-server": "./dist/main.js"
   },
   "scripts": {
     "start": "node --experimental-strip-types src/main.ts",
