@@ -3,17 +3,91 @@ on:
   push: { branches: [main] }
   pull_request:
 
+# 같은 ref 의 이전 런은 의미가 없다 — 새 푸시가 답을 갱신한다.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: typecheck + test
+    name: typecheck + test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines 가 >=22.6 을 주장하면 22 만 재는 것은 검증되지 않은 주장이다.
+        node-version: ['22.x', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node-version }}', cache: npm }
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  package:
+    # 배포판만 죽는 결함을 잡는 잡. 로컬은 src 를 strip-types 로 직접 돌리므로 전부
+    # 초록인데 tarball 은 실행 불가일 수 있다 — bin 이 files 밖의 .ts 를 가리켰던 적이
+    # 실제로 있다(node_modules 안의 .ts 는 type stripping 이 거부된다).
+    #
+    # `npm pack --dry-run` 으로는 못 잡는다: 그건 tarball 에 무엇이 실렸는지만 보고하고,
+    # 그 목록은 당시에도 정상으로 보였다. 빠진 것은 실린 파일이 import 하는 다른 파일이고
+    # 실패는 런타임에서 났다. 그래서 여기서는 "실린 것이 실행되는지"를 본다.
+    #
+    # 설치를 `@izagood/avcs@latest` 와 함께 하는 것도 의도다 — peer 범위가 현재 avcs
+    # 릴리스를 배제하면 여기서 ERESOLVE 로 걸린다(^0.45.0 이 0.45.x 를 핀해 소비자가
+    # 설치조차 못 했던 적이 있다). 적합성 잡이 avcs main 을 쓰는 것과 같은 자세다:
+    # avcs 릴리스와의 비호환은 사용자의 npm i 가 아니라 이 배지에서 먼저 빨개져야 한다.
+    name: packaged CLI smoke (pack → install → run)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '22.x', cache: npm }
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+
+      - name: Pack the release tarball
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/pkg"
+          # prepack 이 build 를 돌린다 — 빌드 안 된 dist 로 패킹되는 일이 없다.
+          npm pack --pack-destination "$RUNNER_TEMP/pkg"
+          ls -l "$RUNNER_TEMP/pkg"
+
+      - name: Install it into an empty project, next to the current avcs release
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          printf '{"name":"consumer","private":true,"type":"module"}\n' > package.json
+          npm install "$RUNNER_TEMP"/pkg/*.tgz @izagood/avcs@latest
+          echo "installed:"
+          node -p "require('@izagood/avcs-server/package.json').version"
+          node -p "require('@izagood/avcs/package.json').version"
+
+      - name: Run the installed CLI and make it answer the protocol
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/consumer"
+          AVCS_SERVER_DATA=./data PORT=8420 ./node_modules/.bin/avcs-server &
+          # 고정 sleep 이 아니라 준비 폴링 — 느린 러너에서 흔들리지 않는다.
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8420/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8420/healthz
+          curl -sf "http://127.0.0.1:8420/acme/web/version" -o version.json
+          cat version.json
+          # 능력 광고까지 봐야 "켜졌다"가 아니라 "프로토콜을 답한다"가 증명된다.
+          node -e "
+            const v = require('./version.json');
+            const want = { name: 'avcs-server', integrate: true, events: true, batch: true };
+            for (const [k, e] of Object.entries(want)) {
+              if (v[k] !== e) throw new Error(\`/version.\${k}: expected \${e}, got \${v[k]}\`);
+            }
+            if (typeof v.protocol !== 'number') throw new Error('/version.protocol missing');
+            console.log('packaged CLI answers /version — protocol', v.protocol);
+          "
 
   conformance:
     # 이 레포의 진짜 게이트 — avcs 의 적합성 스위트를 실행 중인 이 서버에 대고 돌린다.
@@ -36,14 +110,17 @@ jobs:
         run: |
           cd server
           AVCS_SERVER_DATA=/tmp/data PORT=8419 npm start &
-          sleep 2
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8419/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
           cd ../avcs
           # 클론 검사는 내용을 요구한다 — 실사용 그대로 core 3개 엔드포인트로 시드한다.
           mkdir /tmp/seed && cd /tmp/seed
-          node --experimental-strip-types $GITHUB_WORKSPACE/avcs/src/cli.ts init .
+          node --experimental-strip-types "$GITHUB_WORKSPACE/avcs/src/cli.ts" init .
           echo seed > a.txt
-          node --experimental-strip-types $GITHUB_WORKSPACE/avcs/src/cli.ts commit -m seed
-          node --experimental-strip-types $GITHUB_WORKSPACE/avcs/src/cli.ts push http://127.0.0.1:8419/acme/web
+          node --experimental-strip-types "$GITHUB_WORKSPACE/avcs/src/cli.ts" commit -m seed
+          node --experimental-strip-types "$GITHUB_WORKSPACE/avcs/src/cli.ts" push http://127.0.0.1:8419/acme/web
       - name: Conformance
         run: |
           cd avcs
