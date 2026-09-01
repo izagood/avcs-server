@@ -411,7 +411,7 @@ export class RepoEngine {
   /** Resolves with the answer — immediately when the caller is behind, on the next mutation
    *  when caught up, or with a heartbeat at the timeout. Transport-agnostic: a binding just
    *  awaits and writes. */
-  async events(sinceRaw: string | null, timeoutRaw: string | null): Promise<Answer> {
+  async events(sinceRaw: string | null, timeoutRaw: string | null, opts?: { signal?: AbortSignal }): Promise<Answer> {
     const since = parseSince(sinceRaw);
     const toNum = Number(timeoutRaw ?? "30000");
     const timeoutMs = Math.min(Math.max(Number.isFinite(toNum) ? Math.floor(toNum) : 30_000, 10), 120_000);
@@ -424,6 +424,11 @@ export class RepoEngine {
     return new Promise<Answer>((resolve) => {
       const waiter = { since, resolve, timer: setTimeout(() => this.#answer(waiter), timeoutMs) };
       this.#waiters.add(waiter);
+      // A poller that disconnected must free its slot NOW, not at the timeout — parked
+      // slots are capacity (503 past the cap), so a leaver holding one starves live
+      // pollers. The binding passes the request's abort signal; the promise still
+      // resolves (with a final snapshot) so no caller is left hanging.
+      opts?.signal?.addEventListener("abort", () => this.#answer(waiter), { once: true });
     });
   }
 

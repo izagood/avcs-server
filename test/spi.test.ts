@@ -234,3 +234,25 @@ test("hooks: 바인딩이 준 per-request context 가 이벤트로 흐른다", a
   engine.close();
   await rm(dir, { recursive: true, force: true });
 });
+
+test("events: 끊긴 폴러는 타임아웃 전에 슬롯을 비운다 (AbortSignal)", async () => {
+  const { mkdtemp: mk } = await import("node:fs/promises");
+  const { ObjectStore } = await import("@izagood/avcs/store");
+  const { RepoEngine } = await import("../src/engine.ts");
+  const dir = await mk(join(tmpdir(), "avcs-server-abort-"));
+  const store = new ObjectStore(dir);
+  await store.init();
+  // 캡 1 — 자리 하나를 쥐고 있으면 다음 폴러가 503 인 것으로 "차 있음" 을 관측한다
+  const engine = new RepoEngine({ repo: { org: "a", repo: "b" }, store, maxEventsWaiters: 1 });
+  const ac = new AbortController();
+  const parked = engine.events("0", "60000", { signal: ac.signal });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal((await engine.events("0", "50")).status, 503, "음성 대조 — 캡이 차 있다");
+  ac.abort(); // 클라이언트 절단
+  const answer = await parked;
+  assert.equal(answer.status, 200, "떠난 폴러도 매달리지 않는다 — 마지막 스냅샷으로 풀린다");
+  const after = await engine.events("0", "50");
+  assert.equal(after.status, 200, "슬롯이 즉시 비었다 — 타임아웃(60s)을 기다리지 않았다");
+  engine.close();
+  await rm(dir, { recursive: true, force: true });
+});

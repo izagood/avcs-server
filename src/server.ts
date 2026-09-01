@@ -140,7 +140,9 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
       if (path === "/sync") return send(res, await engine.sync(url.searchParams.get("since")));
       if (path === "/refs") return send(res, await engine.refs());
       if (path === "/events") {
-        return send(res, await engine.events(url.searchParams.get("since"), url.searchParams.get("timeoutMs")));
+        const ac = new AbortController();
+        req.once("close", () => ac.abort());
+        return send(res, await engine.events(url.searchParams.get("since"), url.searchParams.get("timeoutMs"), { signal: ac.signal }));
       }
       if (rest[0] === "objects" && rest.length === 2) {
         return send(res, await engine.getObject(decodeURIComponent(rest[1]!)));
