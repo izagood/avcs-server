@@ -17,7 +17,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.7.2",
-    "@izagood/avcs": "^0.45.0"
+    "@izagood/avcs": "^0.47.1"
   },
   "engines": {
     "node": ">=22.6"
@@ -49,6 +49,6 @@
     "LICENSE"
   ],
   "peerDependencies": {
-    "@izagood/avcs": "^0.45.0"
+    "@izagood/avcs": ">=0.47.1 <1"
   }
 }
