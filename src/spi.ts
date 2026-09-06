@@ -30,6 +30,20 @@ export interface StorageBackend {
   readObjLog(): Promise<string[]>;
   listRefs(): Promise<Map<string, string>>;
   getRef(name: string): Promise<string | null>;
+  /**
+   * Write a ref. OPTIONAL, and the only writing member of this interface.
+   *
+   * Refs are otherwise read-only here on purpose: the governance refs `/refs` serves are
+   * the hub's own, and the judgement plane (`JudgementBackend`) is what moves a head. The
+   * exception is `workspaces.landed` (docs/26 §5-2) — the set of workspaces that have
+   * landed onto the base line. That one is authored by whoever ran `avcs land`, not by the
+   * hub, so it travels client→hub and something has to persist it on arrival.
+   *
+   * Optional so an existing backend keeps compiling and a storage layer that genuinely
+   * cannot write refs stays legal: the engine answers `/landed` with 404 when it is
+   * absent, which is the documented shape for a capability a server does not offer (§0).
+   */
+  setRef?(name: string, oid: string): Promise<void>;
 }
 
 /**
