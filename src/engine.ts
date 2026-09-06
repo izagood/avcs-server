@@ -330,6 +330,77 @@ export class RepoEngine {
     return { status: 200, body: { refs: Object.fromEntries(await this.#store.listRefs()) } };
   }
 
+  /**
+   * The landed-workspace set (docs/26 §5-2).
+   *
+   * `/refs` distributes what the hub is authoritative for, one way, and a client never
+   * pushes a ref. That is right for governance — but landing is authored by whoever ran
+   * `avcs land`, so it flows the other way and needs a route of its own.
+   *
+   * Without one the fact is stranded: the blob naming the landed workspaces pushes fine as
+   * an ordinary object, only the ref pointing at it cannot travel. The receiving replica
+   * then sees an empty set, reduces that workspace's ops back out of the base view, and
+   * materializes the pre-land tree — while the push reported success. Nothing surfaces,
+   * because there is no error to raise (avcs#173).
+   */
+  async landed(): Promise<Answer> {
+    return { status: 200, body: { landed: await this.#readLanded() } };
+  }
+
+  /**
+   * Merge a client's landed set into the hub's.
+   *
+   * UNION, never replace. `landWorkspace` is idempotent add-only and there is no unland
+   * (avcs docs/16 §5), so the set only grows: merging two of them cannot lose a name and
+   * does not depend on arrival order. That is what makes this safe without a CAS —
+   * concurrent landers converge on the same set whatever sequence the requests arrive in.
+   */
+  async putLanded(raw: string, authHeader: string | undefined): Promise<Answer> {
+    if (!this.#store.setRef) return { status: 404, body: { error: "not found" } };
+    const auth = await this.#verifyWrite("POST", "/landed", raw, authHeader);
+    if (!("ok" in auth)) return auth;
+    let body: { workspaces?: unknown };
+    try {
+      body = JSON.parse(raw) as typeof body;
+    } catch {
+      return { status: 400, body: { error: "invalid JSON" } };
+    }
+    const incoming = body.workspaces;
+    if (!Array.isArray(incoming) || incoming.some((w) => typeof w !== "string")) {
+      return { status: 400, body: { error: "landed requires { workspaces: string[] }" } };
+    }
+    const have = new Set(await this.#readLanded());
+    const before = have.size;
+    for (const name of incoming as string[]) have.add(name);
+    const landed = [...have].sort();
+    // Write only when the set actually grew — a re-push of an unchanged set is a no-op
+    // rather than a new blob plus a ref rewrite on every sync.
+    if (have.size !== before) {
+      const json = JSON.stringify(landed);
+      const oid = await this.#store.put({
+        type: "blob",
+        data: Buffer.from(json, "utf8").toString("base64"),
+        encoding: "base64",
+      });
+      await this.#store.setRef("workspaces.landed", oid);
+    }
+    return { status: 200, body: { landed } };
+  }
+
+  /** The landed names this hub holds, or `[]` when the ref is absent or unreadable. */
+  async #readLanded(): Promise<string[]> {
+    const ref = await this.#store.getRef("workspaces.landed");
+    if (!ref) return [];
+    try {
+      const blob = (await this.#store.get(ref)) as { data?: string } | null;
+      if (!blob?.data) return [];
+      const parsed = JSON.parse(Buffer.from(blob.data, "base64").toString("utf8")) as unknown;
+      return Array.isArray(parsed) ? parsed.filter((n): n is string => typeof n === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
   async finalize(raw: string, authHeader: string | undefined, context?: unknown): Promise<Answer> {
     if (!this.#judge) return { status: 404, body: { error: "not found" } };
     const auth = await this.#verifyWrite("POST", "/finalize", raw, authHeader);

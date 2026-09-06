@@ -139,6 +139,7 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
       if (path === "/have") return send(res, await engine.have());
       if (path === "/sync") return send(res, await engine.sync(url.searchParams.get("since")));
       if (path === "/refs") return send(res, await engine.refs());
+      if (path === "/landed") return send(res, await engine.landed());
       if (path === "/events") {
         const ac = new AbortController();
         req.once("close", () => ac.abort());
@@ -170,6 +171,7 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
       }
       if (path === "/finalize") return send(res, await engine.finalize(raw, auth));
       if (path === "/integrate") return send(res, await engine.integrate(raw, auth));
+      if (path === "/landed") return send(res, await engine.putLanded(raw, auth));
     }
 
     // Optional endpoints this instance does not serve. 404 is the protocol's word for
