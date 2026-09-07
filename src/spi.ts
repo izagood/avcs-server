@@ -67,6 +67,41 @@ export interface JudgementBackend {
 }
 
 /**
+ * What a reduction backend hands the engine: the library's `ReductionResult` with its Maps as
+ * plain objects and synthetic blob bytes by oid. The engine adds cursor · materializer · ETag ·
+ * the tree cap — those are protocol, not reduction.
+ */
+export interface Reduction {
+  treeHash: string;
+  statuses: Record<string, string>;
+  headOps: string[];
+  conflicts: unknown[];
+  fileConflicts: unknown[];
+  blockedReasons: Record<string, string>;
+  untrustedEvidence: number;
+  tree: Record<string, string>;
+  /** oid → bytes of blobs that exist in NO store (3-way merge results, docs/26 §6-4). */
+  synth: Record<string, Uint8Array>;
+}
+
+/**
+ * The derived-state plane (docs/26 §6-4, avcs docs/27). The default wraps the library's
+ * `Repo.materialize` on the repo's data directory — the same delegation the judgement plane
+ * makes and for the same reason: a second reducer is how two servers drift apart. This
+ * interface exists for *routing* (a remote reduction service, a cache in front of one), not
+ * for re-deciding.
+ *
+ * INDEPENDENT of `JudgementBackend`: a read-only mirror may serve derived state without
+ * serving the integration queue (a web UI over a mirror is this plane's first user), and a
+ * deployment whose storage cannot host the library `Repo` provides neither — `/reduced` then
+ * answers 404 and `/version` says `reduced: false` (§0).
+ */
+export interface ReductionBackend {
+  /** The view's current reduction, or `null` when the view does not exist. */
+  reduce(args: { view: string }): Promise<Reduction | null>;
+}
+
+/**
  * Who may write, and who may read. The engine owns the AVCS-Sig *verification* (docs/26 §7 —
  * the library's `verifyAuth` is the canonical implementation and this server only wires it);
  * this interface owns the *directory* the verification consults.
@@ -142,4 +177,7 @@ export interface Answer {
   body: unknown;
   /** Set on a 429 — the binding must surface it as the `retry-after` header (§4-4). */
   retryAfterSeconds?: number;
+  /** Set on `/reduced` answers — the binding must surface it as the `ETag` header; a 304
+   *  carries it and no body (§6-4). */
+  etag?: string;
 }
