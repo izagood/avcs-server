@@ -47,7 +47,9 @@ key directories and product hooks are for embedders — see [Embedding](#embeddi
 
 ## Protocol support
 
-Every level below is verified by the avcs conformance suite in CI, with zero skips.
+Every level below is verified by the avcs conformance suite in CI, with zero skips. Extensions
+sit outside the cumulative level ladder (avcs docs/26 §11) — they are measured only when
+advertised and never change a level's result.
 
 | Level | Endpoints | Status |
 |---|---|---|
@@ -55,6 +57,7 @@ Every level below is verified by the avcs conformance suite in CI, with zero ski
 | `sync` | `GET /sync` (incremental cursor) · `POST /objects/batch` · `POST /objects/fetch` | ✅ conformance-verified |
 | `governance` | `GET /refs` · `POST /finalize` (head CAS) | ✅ conformance-verified |
 | `queue` | `POST /integrate` · `GET /integrations/:ticketId` · `GET /events` (long-poll) | ✅ conformance-verified |
+| `reduced` (extension) | `GET /reduced` · `GET /reduced/blob/:oid` — derived state for clients that do not replicate | ✅ conformance-verified |
 
 `GET /version` advertises the capabilities actually composed in, and `GET /healthz` answers
 outside any repo prefix. To re-run the suite against your own instance, from a checkout of the
@@ -67,6 +70,13 @@ AVCS_CONFORMANCE_URL=http://localhost:8420/acme/web npm run conformance
 The judgement plane (`finalize` / `integrate`) is delegated to the avcs library's `Repo`: a queue
 verdict must be a pure function of objects + Protection, and a second implementation of that
 function is exactly how two servers drift apart.
+
+The derived-state plane (`GET /reduced`, docs/26 §6-4) is delegated the same way, to
+`Repo.materialize`, so a client that does not replicate — a web UI, a bot, another language —
+reads exactly what a replica would compute: statuses, conflicts, head ops, `treeHash`, and the
+path → blob-oid tree map (blob bytes come from the ordinary `GET /objects/:oid`; merge results
+that exist in no store come from `GET /reduced/blob/:oid`). The answer is not an authority —
+replicas prefer their own reduce. `ETag` / `If-None-Match` make polling free.
 
 ## Embedding
 
@@ -88,6 +98,7 @@ await startAvcsServer({
   },
   storageFor: (repo, dir) => myBackend(repo),  // StorageBackend: default is the library's ObjectStore
   judgeFor: (repo, dir) => myJudge(repo),      // JudgementBackend: return null to not serve the plane
+  reduceFor: (repo, dir) => myReducer(repo),   // ReductionBackend: return null to not serve /reduced
 });
 ```
 
@@ -95,14 +106,14 @@ await startAvcsServer({
 |---|---|
 | `@izagood/avcs-server` | `startAvcsServer(opts)` — the stdlib http server, batteries included |
 | `@izagood/avcs-server/engine` | `RepoEngine` — every endpoint as `(raw request parts) → { status, body }` |
-| `@izagood/avcs-server/spi` | The seam types: `StorageBackend`, `JudgementBackend`, `IdentityProvider`, `Hooks` |
+| `@izagood/avcs-server/spi` | The seam types: `StorageBackend`, `JudgementBackend`, `ReductionBackend`, `IdentityProvider`, `Hooks` |
 
 The engine has no `node:http` and no framework in it, so binding it to Fastify, Express or a
 serverless handler means reimplementing [`src/server.ts`](./src/server.ts) — about 100 lines of
 URL parsing and body collection — and none of the protocol.
 
-Capability flags follow composition honestly: no judge ⇒ `integrate: false` and a 404, which the
-protocol defines as "fall back", not "error". Auth verification is the library's `verifyAuth`
+Capability flags follow composition honestly: no judge ⇒ `integrate: false` and a 404, no reducer
+⇒ `reduced: false` and a 404 — which the protocol defines as "fall back", not "error". Auth verification is the library's `verifyAuth`
 (docs/26 §7); this server only wires the directory, and credentials are scope-checked per repo so
 a signature captured for one tenant is refused on another.
 
