@@ -9,10 +9,10 @@ import { join } from "node:path";
 import { ObjectStore } from "@izagood/avcs/store";
 import { Repo } from "@izagood/avcs";
 import { RepoEngine, MAX_BODY } from "./engine.ts";
-import type { Answer, Hooks, IdentityProvider, JudgementBackend, RepoRef, StorageBackend } from "./spi.ts";
+import type { Answer, Hooks, IdentityProvider, JudgementBackend, Reduction, ReductionBackend, RepoRef, StorageBackend } from "./spi.ts";
 
-export type { Answer, Hooks, IdentityProvider, JudgementBackend, RepoRef, StorageBackend, StoredObject, WriteEvent, WriteVeto } from "./spi.ts";
-export { RepoEngine, coreNativeIdentity } from "./engine.ts";
+export type { Answer, Hooks, IdentityProvider, JudgementBackend, Reduction, ReductionBackend, RepoRef, StorageBackend, StoredObject, WriteEvent, WriteVeto } from "./spi.ts";
+export { RepoEngine, coreNativeIdentity, REDUCED_TREE_MAX_ENTRIES } from "./engine.ts";
 
 /**
  * One path segment of an org or repo name. The prefix routes straight to a directory under
@@ -40,6 +40,11 @@ export interface AvcsServerOpts {
   /** Judgement per repo. Default: the library's `Repo` on the same directory. Return null
    *  to not serve the judgement plane (e.g. on a storage backend with no filesystem). */
   judgeFor?: (repo: RepoRef, dir: string) => Promise<JudgementBackend | null>;
+  /** Reduction per repo (docs/26 §6-4). Default: the library's `Repo.materialize` on the same
+   *  directory. Return null to not serve the derived-state plane. Independent of `judgeFor`. */
+  reduceFor?: (repo: RepoRef, dir: string) => Promise<ReductionBackend | null>;
+  /** `tree` entries above which /reduced omits the tree (default 50 000). */
+  reducedTreeMaxEntries?: number;
   /** AVCS-Sig freshness window override (test hook). */
   authWindowMs?: number;
 }
@@ -81,10 +86,41 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
               submitIntegration: async (args: Parameters<JudgementBackend["submitIntegration"]>[0]) =>
                 (await Repo.open(dir)).submitIntegration(args),
             };
+        // The default reducer is the library's `Repo.materialize` on the same directory — the
+        // same delegation the judge makes, for the same reason (a second reducer is how two
+        // servers drift). Opened per call like the judge; the persisted snapshot makes a cold
+        // open cheap and the engine's ETag cache makes repeat calls free.
+        const reducer: ReductionBackend | null = opts.reduceFor
+          ? await opts.reduceFor(repo, dir)
+          : {
+              reduce: async ({ view }: { view: string }): Promise<Reduction | null> => {
+                const r = await Repo.open(dir);
+                let res: Awaited<ReturnType<Repo["materialize"]>>;
+                try {
+                  res = await r.materialize(view);
+                } catch (e) {
+                  if (/no such view/.test(String((e as Error).message))) return null;
+                  throw e;
+                }
+                return {
+                  treeHash: res.treeHash,
+                  statuses: Object.fromEntries(res.statuses),
+                  headOps: res.headOps,
+                  conflicts: res.conflicts as unknown[],
+                  fileConflicts: res.fileConflicts as unknown[],
+                  blockedReasons: Object.fromEntries(res.blockedReasons),
+                  untrustedEvidence: res.untrustedEvidence,
+                  tree: Object.fromEntries(res.tree),
+                  synth: Object.fromEntries([...res.synthBlobs].map(([oid, b]) => [oid, new Uint8Array(b)])),
+                };
+              },
+            };
         return new RepoEngine({
           repo,
           store,
           ...(judge ? { judge } : {}),
+          ...(reducer ? { reducer } : {}),
+          ...(opts.reducedTreeMaxEntries !== undefined ? { reducedTreeMaxEntries: opts.reducedTreeMaxEntries } : {}),
           ...(opts.gated !== undefined ? { gated: opts.gated } : {}),
           ...(opts.readAccess !== undefined ? { readAccess: opts.readAccess } : {}),
           ...(opts.identity !== undefined ? { identity: opts.identity } : {}),
@@ -140,6 +176,10 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
       if (path === "/sync") return send(res, await engine.sync(url.searchParams.get("since")));
       if (path === "/refs") return send(res, await engine.refs());
       if (path === "/landed") return send(res, await engine.landed());
+      if (path === "/reduced") return send(res, await engine.reduced(url.searchParams.get("view"), headerString(req.headers["if-none-match"])));
+      if (rest[0] === "reduced" && rest[1] === "blob" && rest.length === 3) {
+        return send(res, await engine.reducedBlob(decodeURIComponent(rest[2]!), url.searchParams.get("view"), headerString(req.headers["if-match"])));
+      }
       if (path === "/events") {
         const ac = new AbortController();
         req.once("close", () => ac.abort());
@@ -192,14 +232,25 @@ export async function startAvcsServer(opts: AvcsServerOpts): Promise<AvcsServerH
 }
 
 function send(res: ServerResponse, answer: Answer): void {
-  const raw = JSON.stringify(answer.body);
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    "content-length": String(Buffer.byteLength(raw)),
-  };
+  const headers: Record<string, string> = {};
+  if (answer.etag !== undefined) headers.etag = answer.etag;
   if (answer.retryAfterSeconds !== undefined) headers["retry-after"] = String(answer.retryAfterSeconds);
+  // 304 carries no body by definition (docs/26 §6-4) — the tag alone is the answer.
+  if (answer.status === 304) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
+  const raw = JSON.stringify(answer.body);
+  headers["content-type"] = "application/json";
+  headers["content-length"] = String(Buffer.byteLength(raw));
   res.writeHead(answer.status, headers);
   res.end(raw);
+}
+
+/** A request header as one string — node hands some as arrays; the engine takes strings. */
+function headerString(v: string | string[] | undefined): string | undefined {
+  return Array.isArray(v) ? v[0] : v;
 }
 
 function readBody(req: IncomingMessage): Promise<string> {

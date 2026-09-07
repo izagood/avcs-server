@@ -6,12 +6,13 @@
 // This split is the package's reason to exist as a *library*: the protocol implementation
 // stays in one public place, and a hosted product imports it and injects its concerns
 // through the SPI instead of maintaining a parallel server that drifts.
-import { HUB_PROTOCOL_VERSION, verifyAuth, NonceCache } from "@izagood/avcs";
+import { HUB_PROTOCOL_VERSION, MATERIALIZER_VERSION, canonicalize, sha256hex, verifyAuth, NonceCache } from "@izagood/avcs";
 import type {
   Answer,
   Hooks,
   IdentityProvider,
   JudgementBackend,
+  ReductionBackend,
   RepoRef,
   StorageBackend,
   StoredObject,
@@ -24,6 +25,32 @@ export const MAX_FETCH_OIDS = 4096;
 // The engine bounds its OWN /objects/fetch response and says `truncated` — a client cannot
 // make it materialize an unbounded payload by asking for everything at once (docs/26 §4-6).
 export const MAX_FETCH_BYTES = 4 * 1024 * 1024;
+/** Cap on `tree` entries a /reduced answer carries (avcs docs/27 §4.1). Above it the tree is
+ *  OMITTED — never truncated; a truncated tree reads as deletions. Advertised as
+ *  `reducedTreeMaxEntries` so a client learns it up front instead of through a surprise. */
+export const REDUCED_TREE_MAX_ENTRIES = 50_000;
+
+/** Refs that never feed a reduction and grow without bound — one per integration ticket, one
+ *  per bridged git sha. Everything else stays in the ETag, conservatively (docs/27 §3.4). */
+const ETAG_EXCLUDED_REF = /^(integration:|git:)/;
+
+/** The wire shape of GET /reduced (docs/26 §6-4). */
+interface ReducedBody {
+  view: string;
+  cursor: number;
+  materializer: string;
+  treeHash: string;
+  statuses: Record<string, string>;
+  headOps: string[];
+  conflicts: unknown[];
+  fileConflicts: unknown[];
+  blockedReasons: Record<string, string>;
+  untrustedEvidence: number;
+  tree?: Record<string, string>;
+  synth?: string[];
+  treeOmitted: boolean;
+}
+interface ReducedEntry { etag: string; body: ReducedBody; synth: Record<string, Uint8Array> }
 
 /** An oid as the protocol shapes it: `<type>_<hex>`. Also filename-safe by construction. */
 export const OID = /^[a-z_]+_[0-9a-f]+$/;
@@ -34,6 +61,11 @@ export interface EngineOpts {
   /** Absent ⇒ the judgement plane is not served: /finalize and /integrate answer 404 and
    *  `integrate` advertises false. A partial server is a first-class one (docs/26 §0). */
   judge?: JudgementBackend;
+  /** Absent ⇒ the derived-state plane is not served: /reduced answers 404 and `reduced`
+   *  advertises false. Independent of `judge` — a mirror may serve one without the other. */
+  reducer?: ReductionBackend;
+  /** `tree` entries above which /reduced omits the tree (default 50 000). */
+  reducedTreeMaxEntries?: number;
   /** Writes must carry a valid AVCS-Sig by a resolvable member (docs/26 §7). */
   gated?: boolean;
   /** "public" (default): reads are open. "token": a read must carry a bearer token the
@@ -74,6 +106,9 @@ export class RepoEngine {
   readonly #repo: RepoRef;
   readonly #store: StorageBackend;
   readonly #judge: JudgementBackend | null;
+  readonly #reducer: ReductionBackend | null;
+  readonly #treeMax: number;
+  #reducedCache = new Map<string, ReducedEntry>();
   readonly #gated: boolean;
   readonly #readAccess: "public" | "token";
   readonly #identity: IdentityProvider;
@@ -87,6 +122,8 @@ export class RepoEngine {
     this.#repo = opts.repo;
     this.#store = opts.store;
     this.#judge = opts.judge ?? null;
+    this.#reducer = opts.reducer ?? null;
+    this.#treeMax = opts.reducedTreeMaxEntries ?? REDUCED_TREE_MAX_ENTRIES;
     this.#gated = opts.gated ?? false;
     this.#readAccess = opts.readAccess ?? "public";
     this.#identity = opts.identity ?? coreNativeIdentity(opts.store);
@@ -104,12 +141,18 @@ export class RepoEngine {
       body: {
         name: "avcs-server",
         protocol: HUB_PROTOCOL_VERSION,
+        // docs/26 §3: the reducer version is the ground for "same op set ⇒ same tree". It was
+        // missing here until docs/27 needed it on the /reduced answer as well.
+        materializer: MATERIALIZER_VERSION,
         gated: this.#gated,
         auth: this.#gated ? "required" : "none",
         integrate: this.#judge !== null,
         events: true,
         batch: true,
         batchMaxBytes: MAX_BODY,
+        reduced: this.#reducer !== null,
+        // Only when advertised — a cap for a plane this instance does not have is noise.
+        ...(this.#reducer !== null ? { reducedTreeMaxEntries: this.#treeMax } : {}),
       },
     };
   }
@@ -328,6 +371,76 @@ export class RepoEngine {
   // ── governance plane (docs/26 §5, §6-1) ─────────────────────────────────────────────
   async refs(): Promise<Answer> {
     return { status: 200, body: { refs: Object.fromEntries(await this.#store.listRefs()) } };
+  }
+
+  // ── derived-state plane (docs/26 §6-4, avcs docs/27) ────────────────────────────────
+  /** GET /reduced?view= — the derived state a replica would compute. NOT an authority:
+   *  every replica computes the same value from the same objects; this exists so a client
+   *  that does not replicate (a web UI, a bot, another language) can read it at all.
+   *  ETag = fingerprint of the reduction's inputs; If-None-Match ⇒ 304 without a reduce. */
+  async reduced(viewRaw: string | null, ifNoneMatch: string | undefined): Promise<Answer> {
+    if (!this.#reducer) return { status: 404, body: { error: "not found" } };
+    const view = viewRaw ?? "main";
+    const entry = await this.#reducedFor(view);
+    if (!entry) return { status: 404, body: { error: `no such view: ${view}` } };
+    if (ifNoneMatch === entry.etag) return { status: 304, body: null, etag: entry.etag };
+    return { status: 200, body: entry.body, etag: entry.etag };
+  }
+
+  /** GET /reduced/blob/:oid?view= — bytes of a SYNTHETIC blob (docs/27 §3.2): a 3-way merge
+   *  result exists in no store and must not be put in one (redaction would leave plaintext).
+   *  Only this view's current synth oids answer 200; a stored blob is 404 here (the two routes
+   *  never overlap); an If-Match that no longer holds is 412 — re-read /reduced. */
+  async reducedBlob(oid: string, viewRaw: string | null, ifMatch: string | undefined): Promise<Answer> {
+    if (!this.#reducer) return { status: 404, body: { error: "not found" } };
+    const view = viewRaw ?? "main";
+    const entry = await this.#reducedFor(view);
+    if (!entry) return { status: 404, body: { error: `no such view: ${view}` } };
+    if (typeof ifMatch === "string" && ifMatch !== entry.etag) {
+      return { status: 412, body: { error: "reduction changed — re-read /reduced", etag: entry.etag }, etag: entry.etag };
+    }
+    const bytes = entry.synth[oid];
+    if (!bytes) return { status: 404, body: { error: "not a synthetic blob of this view's current reduction", oid, view }, etag: entry.etag };
+    return { status: 200, body: { oid, data: Buffer.from(bytes).toString("base64"), encoding: "base64" }, etag: entry.etag };
+  }
+
+  /** Same inputs ⇒ same body: a tag match is a safe 304 and a safe cache hit. The same
+   *  algorithm as the reference implementation, so the two agree on a shared store. */
+  async #reducedEtag(view: string): Promise<{ etag: string; cursor: number }> {
+    const all = await this.#store.readObjLog();
+    const refs: Record<string, string> = {};
+    for (const [name, oid] of await this.#store.listRefs()) if (!ETAG_EXCLUDED_REF.test(name)) refs[name] = oid;
+    const digest = sha256hex(canonicalize({ v: 1, view, cursor: all.length, materializer: MATERIALIZER_VERSION, treeMaxEntries: this.#treeMax, refs }));
+    return { etag: `"${digest.slice(0, 32)}"`, cursor: all.length };
+  }
+
+  /** The cached reduction for `view`, recomputed only when its tag moved. The tag is read
+   *  before AND after the backend call and cached only when both agree — the proof the body
+   *  belongs to the tag. (The default backend's first materialize on a pushed-to store seeds
+   *  `view:main`, which appends an object; the loop simply reduces once more.) If the store
+   *  keeps moving, the fresh body is served uncached under the older tag, so the next request
+   *  recomputes and a stale 304 can never be issued. */
+  async #reducedFor(view: string): Promise<ReducedEntry | null> {
+    let pre = await this.#reducedEtag(view);
+    const hit = this.#reducedCache.get(view);
+    if (hit && hit.etag === pre.etag) return hit;
+    for (let attempt = 0; ; attempt++) {
+      const r = await this.#reducer!.reduce({ view });
+      if (!r) return null;
+      const post = await this.#reducedEtag(view);
+      const base = {
+        view, cursor: pre.cursor, materializer: MATERIALIZER_VERSION, treeHash: r.treeHash,
+        statuses: r.statuses, headOps: r.headOps, conflicts: r.conflicts, fileConflicts: r.fileConflicts,
+        blockedReasons: r.blockedReasons, untrustedEvidence: r.untrustedEvidence,
+      };
+      const body: ReducedBody = Object.keys(r.tree).length > this.#treeMax
+        ? { ...base, treeOmitted: true }
+        : { ...base, tree: r.tree, synth: Object.keys(r.synth).sort(), treeOmitted: false };
+      const entry: ReducedEntry = { etag: pre.etag, body, synth: r.synth };
+      if (post.etag === pre.etag) { this.#reducedCache.set(view, entry); return entry; }
+      if (attempt >= 2) return entry; // store still moving — serve fresh, uncached, under the older tag
+      pre = post;
+    }
   }
 
   /**
